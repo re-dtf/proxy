@@ -1,5 +1,5 @@
 export default {
-  async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     
     // Если это OPTIONS (CORS preflight)
