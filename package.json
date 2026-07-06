@@ -1,0 +1,12 @@
+{
+  "name": "dtf-auth-proxy",
+  "version": "1.0.0",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0",
+    "@cloudflare/workers-types": "^4.20240320.1",
+    "typescript": "^5.0.0"
+  }
+}
