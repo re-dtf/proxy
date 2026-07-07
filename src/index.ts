@@ -14,8 +14,9 @@ export default {
       });
     }
 
-    // Собираем новый URL к DTF API (проксируем путь, например /v3.4/auth/email/login)
-    const targetUrl = new URL(`https://api.dtf.ru${url.pathname}${url.search}`);
+    // Собираем новый URL к DTF API, убирая двойные слеши если они есть
+    const cleanPath = url.pathname.replace(/\/+/g, '/');
+    const targetUrl = new URL(`https://api.dtf.ru${cleanPath}${url.search}`);
     
     // Клонируем запрос, чтобы переслать его
     const proxyRequest = new Request(targetUrl.toString(), request);
