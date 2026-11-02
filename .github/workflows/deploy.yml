@@ -1,10 +1,13 @@
 name: Deploy Proxy
+
 on:
   push:
     branches:
       - main
+
 jobs:
-  deploy:
+  deploy-cloudflare:
+    name: Deploy to Cloudflare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -15,7 +18,24 @@ jobs:
           check-latest: true
       - run: npm install
       - name: Deploy to Cloudflare
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
+
+  deploy-valtown:
+    name: Deploy to Val Town
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+
+      - name: Install Val Town CLI
+        run: deno install -grAf jsr:@valtown/vt
+
+      - name: Push and Deploy
+        run: vt push
+        env:
+          VAL_TOWN_API_KEY: ${{ secrets.VT_API_KEY }}

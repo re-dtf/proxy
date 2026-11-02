@@ -1,3 +1,3 @@
 name = "dtf-auth-proxy"
-main = "src/index.ts"
+main = "src/cloudflare.ts"
 compatibility_date = "2024-03-20"
