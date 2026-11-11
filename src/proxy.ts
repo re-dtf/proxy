@@ -1,12 +1,67 @@
 /**
- * reDTF CORS Proxy — общее ядро обработки запросов
+ * reDTF CORS Proxy — общее ядро обработки запросов с защитой от флуда и атак
  */
+
+type RouteCategory = "login" | "refresh" | "search";
+
+const LIMITS: Record<RouteCategory, { max: number; windowMs: number }> = {
+	login: { max: 5, windowMs: 30 * 60 * 1000 }, // 5 запросов на 30 минут
+	refresh: { max: 2, windowMs: 60 * 1000 }, // 2 запроса в минуту
+	search: { max: 5, windowMs: 10 * 60 * 1000 }, // 5 запросов на 10 минут
+};
+
+const MAX_BODY_BYTES = 32 * 1024; // 32 KB максимум для POST-запросов
+const rateLimitStore = new Map<string, number[]>();
+
+function getRouteCategory(method: string, pathname: string): RouteCategory | null {
+	if (method === "POST" && pathname === "/v3.4/auth/email/login") return "login";
+	if (method === "POST" && pathname === "/v3.4/auth/refresh") return "refresh";
+	if (method === "GET" && (pathname === "/v2.10/search/posts" || pathname === "/v2.51/search/subsites")) return "search";
+	return null;
+}
+
+function getClientIp(request: Request): string {
+	const cf = request.headers.get("cf-connecting-ip");
+	if (cf) return cf.trim();
+	const xff = request.headers.get("x-forwarded-for");
+	if (xff) return xff.split(",")[0].trim();
+	return "unknown";
+}
+
+function checkRateLimit(category: RouteCategory, ip: string, now = Date.now()): { limited: boolean; retryAfter: number } {
+	const { max, windowMs } = LIMITS[category];
+	const key = `${category}:${ip}`;
+	const cutoff = now - windowMs;
+
+	// Очистка при разрастании памяти
+	if (rateLimitStore.size > 1000) {
+		for (const [k, timestamps] of rateLimitStore) {
+			const cat = k.split(":")[0] as RouteCategory;
+			const win = LIMITS[cat]?.windowMs || 60_000;
+			if (timestamps.length === 0 || timestamps[timestamps.length - 1] < now - win) {
+				rateLimitStore.delete(k);
+			}
+		}
+	}
+
+	const timestamps = (rateLimitStore.get(key) || []).filter((t) => t > cutoff);
+
+	if (timestamps.length >= max) {
+		const retryAfter = Math.max(1, Math.ceil((timestamps[0] + windowMs - now) / 1000));
+		rateLimitStore.set(key, timestamps);
+		return { limited: true, retryAfter };
+	}
+
+	timestamps.push(now);
+	rateLimitStore.set(key, timestamps);
+	return { limited: false, retryAfter: 0 };
+}
 
 export async function handleRequest(request: Request): Promise<Response> {
 	const url = new URL(request.url);
-	const corsHeaders = {
+	const corsHeaders: Record<string, string> = {
 		"Access-Control-Allow-Origin": request.headers.get("Origin") || "*",
-		"Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+		"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 		"Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "*",
 		"Access-Control-Allow-Credentials": "true",
 	};
@@ -20,10 +75,46 @@ export async function handleRequest(request: Request): Promise<Response> {
 		return Response.json({ ok: true, message: "reDTF proxy ready" }, { headers: corsHeaders });
 	}
 
+	// 1. Белый список маршрутов
+	const category = getRouteCategory(request.method, url.pathname);
+	if (!category) {
+		return Response.json({ error: "Endpoint not allowed" }, { status: 403, headers: corsHeaders });
+	}
+
+	// 2. Ограничение размера входящего тела
+	let body: ArrayBuffer | undefined;
+	if (request.method !== "GET" && request.method !== "HEAD") {
+		const contentLength = Number(request.headers.get("content-length") || 0);
+		if (contentLength > MAX_BODY_BYTES) {
+			return Response.json({ error: "Payload too large" }, { status: 413, headers: corsHeaders });
+		}
+		body = await request.arrayBuffer();
+		if (body.byteLength > MAX_BODY_BYTES) {
+			return Response.json({ error: "Payload too large" }, { status: 413, headers: corsHeaders });
+		}
+	}
+
+	// 3. Рейт-лимит по IP
+	const ip = getClientIp(request);
+	const { limited, retryAfter } = checkRateLimit(category, ip);
+	if (limited) {
+		return Response.json(
+			{ error: `Too many requests for ${category}. Try again in ${retryAfter}s.` },
+			{
+				status: 429,
+				headers: {
+					...corsHeaders,
+					"Retry-After": String(retryAfter),
+				},
+			}
+		);
+	}
+
+	// 4. Проксирование запроса к API DTF
 	try {
 		const targetUrl = new URL(url.pathname + url.search, "https://api.dtf.ru");
 		const reqHeaders = new Headers(request.headers);
-		for (const h of ["host", "origin", "referer", "cf-connecting-ip", "cf-ray", "accept-encoding"]) {
+		for (const h of ["host", "origin", "referer", "cf-connecting-ip", "cf-ray", "accept-encoding", "content-length"]) {
 			reqHeaders.delete(h);
 		}
 		reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36");
@@ -31,7 +122,7 @@ export async function handleRequest(request: Request): Promise<Response> {
 		const response = await fetch(targetUrl, {
 			method: request.method,
 			headers: reqHeaders,
-			body: request.method !== "GET" && request.method !== "HEAD" ? request.body : undefined,
+			body,
 		});
 
 		const resHeaders = new Headers(response.headers);
