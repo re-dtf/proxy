@@ -114,13 +114,13 @@ describe("reDTF proxy security & rate limiting", () => {
 		}
 	});
 
-	it("применяет рейт-лимит для search: 5 запросов на IP (429 на 6-й) суммарно для posts и subsites", async () => {
+	it("применяет рейт-лимит для search: до 5 запросов в минуту на IP (429 на 6-й) суммарно для posts, subsites и comments", async () => {
 		const ip = "1.2.3.20";
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = async () => new Response(JSON.stringify({ result: [] }), { status: 200 });
 
 		try {
-			for (let i = 0; i < 3; i++) {
+			for (let i = 0; i < 2; i++) {
 				const res = await handleRequest(
 					new Request(`https://example.com/v2.10/search/posts?q=test${i}`, {
 						method: "GET",
@@ -140,9 +140,17 @@ describe("reDTF proxy security & rate limiting", () => {
 				assert.equal(res.status, 200);
 			}
 
-			// 6-й запрос поиска
+			const resComments = await handleRequest(
+				new Request("https://example.com/v2.51/search/comments?q=test", {
+					method: "GET",
+					headers: { "cf-connecting-ip": ip },
+				})
+			);
+			assert.equal(resComments.status, 200);
+
+			// 6-й запрос поиска в ту же минуту
 			const res6 = await handleRequest(
-				new Request("https://example.com/v2.10/search/posts?q=overflow", {
+				new Request("https://example.com/v2.51/search/comments?q=overflow", {
 					method: "GET",
 					headers: { "cf-connecting-ip": ip },
 				})
@@ -150,6 +158,54 @@ describe("reDTF proxy security & rate limiting", () => {
 			assert.equal(res6.status, 429);
 			assert.ok(res6.headers.get("Retry-After"));
 		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("применяет часовой рейт-лимит для search: до 30 запросов в час на IP (429 на 31-й)", async () => {
+		const ip = "1.2.3.21";
+		const originalFetch = globalThis.fetch;
+		const originalNow = Date.now;
+		let now = 1_700_000_000_000;
+		Date.now = () => now;
+		globalThis.fetch = async () => new Response(JSON.stringify({ result: [] }), { status: 200 });
+
+		try {
+			// 6 серий по 5 запросов с шагом 2 минуты (итого 30 запросов за 10 минут)
+			for (let batch = 0; batch < 6; batch++) {
+				for (let i = 0; i < 5; i++) {
+					const res = await handleRequest(
+						new Request(`https://example.com/v2.10/search/posts?q=b${batch}_${i}`, {
+							method: "GET",
+							headers: { "cf-connecting-ip": ip },
+						})
+					);
+					assert.equal(res.status, 200);
+				}
+				now += 2 * 60 * 1000;
+			}
+
+			// 31-й запрос в пределах часа блокируется, даже если минутное окно свободно
+			const res31 = await handleRequest(
+				new Request("https://example.com/v2.51/search/comments?q=overflow", {
+					method: "GET",
+					headers: { "cf-connecting-ip": ip },
+				})
+			);
+			assert.equal(res31.status, 429);
+			assert.ok(Number(res31.headers.get("Retry-After")) > 60);
+
+			// После истечения часа с первого запроса слоты освобождаются
+			now = 1_700_000_000_000 + 60 * 60 * 1000 + 1000;
+			const resAfterHour = await handleRequest(
+				new Request("https://example.com/v2.51/search/comments?q=ok", {
+					method: "GET",
+					headers: { "cf-connecting-ip": ip },
+				})
+			);
+			assert.equal(resAfterHour.status, 200);
+		} finally {
+			Date.now = originalNow;
 			globalThis.fetch = originalFetch;
 		}
 	});

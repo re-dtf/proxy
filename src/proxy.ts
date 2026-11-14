@@ -3,12 +3,22 @@
  */
 
 type RouteCategory = "login" | "refresh" | "search";
+type RateRule = { max: number; windowMs: number };
 
-const LIMITS: Record<RouteCategory, { max: number; windowMs: number }> = {
-	login: { max: 5, windowMs: 30 * 60 * 1000 }, // 5 запросов на 30 минут
-	refresh: { max: 2, windowMs: 60 * 1000 }, // 2 запроса в минуту
-	search: { max: 5, windowMs: 10 * 60 * 1000 }, // 5 запросов на 10 минут
+const LIMITS: Record<RouteCategory, RateRule[]> = {
+	login: [{ max: 5, windowMs: 30 * 60 * 1000 }], // 5 запросов на 30 минут
+	refresh: [{ max: 2, windowMs: 60 * 1000 }], // 2 запроса в минуту
+	search: [
+		{ max: 5, windowMs: 60 * 1000 }, // до 5 запросов в минуту
+		{ max: 30, windowMs: 60 * 60 * 1000 }, // до 30 запросов в час
+	],
 };
+
+const SEARCH_PATHS = new Set([
+	"/v2.10/search/posts",
+	"/v2.51/search/subsites",
+	"/v2.51/search/comments",
+]);
 
 const MAX_BODY_BYTES = 32 * 1024; // 32 KB максимум для POST-запросов
 const rateLimitStore = new Map<string, number[]>();
@@ -16,7 +26,7 @@ const rateLimitStore = new Map<string, number[]>();
 function getRouteCategory(method: string, pathname: string): RouteCategory | null {
 	if (method === "POST" && pathname === "/v3.4/auth/email/login") return "login";
 	if (method === "POST" && pathname === "/v3.4/auth/refresh") return "refresh";
-	if (method === "GET" && (pathname === "/v2.10/search/posts" || pathname === "/v2.51/search/subsites")) return "search";
+	if (method === "GET" && SEARCH_PATHS.has(pathname)) return "search";
 	return null;
 }
 
@@ -28,26 +38,40 @@ function getClientIp(request: Request): string {
 	return "unknown";
 }
 
+function maxWindowFor(category: RouteCategory): number {
+	const rules = LIMITS[category];
+	if (!rules || rules.length === 0) return 60_000;
+	return Math.max(...rules.map((r) => r.windowMs));
+}
+
 function checkRateLimit(category: RouteCategory, ip: string, now = Date.now()): { limited: boolean; retryAfter: number } {
-	const { max, windowMs } = LIMITS[category];
+	const rules = LIMITS[category];
 	const key = `${category}:${ip}`;
-	const cutoff = now - windowMs;
+	const maxWindowMs = maxWindowFor(category);
 
 	// Очистка при разрастании памяти
 	if (rateLimitStore.size > 1000) {
 		for (const [k, timestamps] of rateLimitStore) {
 			const cat = k.split(":")[0] as RouteCategory;
-			const win = LIMITS[cat]?.windowMs || 60_000;
+			const win = maxWindowFor(cat);
 			if (timestamps.length === 0 || timestamps[timestamps.length - 1] < now - win) {
 				rateLimitStore.delete(k);
 			}
 		}
 	}
 
-	const timestamps = (rateLimitStore.get(key) || []).filter((t) => t > cutoff);
+	const timestamps = (rateLimitStore.get(key) || []).filter((t) => t > now - maxWindowMs);
 
-	if (timestamps.length >= max) {
-		const retryAfter = Math.max(1, Math.ceil((timestamps[0] + windowMs - now) / 1000));
+	let retryAfter = 0;
+	for (const { max, windowMs } of rules) {
+		const inWindow = timestamps.filter((t) => t > now - windowMs);
+		if (inWindow.length >= max) {
+			const wait = Math.max(1, Math.ceil((inWindow[0] + windowMs - now) / 1000));
+			if (wait > retryAfter) retryAfter = wait;
+		}
+	}
+
+	if (retryAfter > 0) {
 		rateLimitStore.set(key, timestamps);
 		return { limited: true, retryAfter };
 	}
